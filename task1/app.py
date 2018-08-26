@@ -1,6 +1,5 @@
 #!/usr/bin/env python
 import datetime
-import json
 import random
 import sys
 import string
@@ -53,11 +52,10 @@ class Generator:
 class Handler:
 
     def __init__(self, redis_inst):
-        self.name = str(uuid4())
         self.redis_inst = redis_inst
 
         self.pub_sub = redis_inst.pubsub()
-        self.pub_sub.subscribe(f'message_for_{self.name}')
+        self.pub_sub.subscribe(f'message_for_{uuid4()}')
 
     def check_generator(self):
         if self.redis_inst.incr('checking_generator_lock') == 1:
@@ -69,9 +67,9 @@ class Handler:
             return generator
 
     def process_loop(self):
-        generator = self.check_generator()
-        if generator:
-            return generator
+        new_generator = self.check_generator()
+        if new_generator:
+            return new_generator
 
         message = self.pub_sub.get_message()
         if message and message['type'] == 'message':
