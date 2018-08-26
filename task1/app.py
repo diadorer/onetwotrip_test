@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+import datetime
 import json
 import random
 import sys
@@ -11,30 +12,11 @@ import conf
 import redis
 
 
-PROCESS_MESSAGE_EVENT = 'process_message'
-BECOME_GENERATOR_EVENT = 'become_generator_event'
-
-
 def run(redis_inst):
-    current_generator = redis_inst.get('generator')
-    if current_generator:
-        app_inst = Handler(redis_inst)
+    app_inst = Handler(redis_inst)
 
-    else:
-        app_inst = Generator(redis_inst)
-
-    try:
-        while True:
-            app_inst = app_inst.process_loop()
-    except KeyboardInterrupt:
-        app_inst.on_keyboard_interrupt()
-
-
-def process_errors(redis_inst):
-    error_item = redis_inst.lpop('errors')
-    while error_item:
-        print(error_item)
-        error_item = redis_inst.lpop('errors')
+    while True:
+        app_inst = app_inst.process_loop()
 
 
 class Generator:
@@ -42,7 +24,8 @@ class Generator:
     def __init__(self, redis_inst):
         self.redis_inst = redis_inst
 
-        redis_inst.set('generator', '1')
+        self.pub_sub = redis_inst.pubsub()
+        self.pub_sub.subscribe('generator')
 
     def process_loop(self):
         self.send_text_message()
@@ -57,35 +40,14 @@ class Generator:
 
     def send_text_message(self):
         message_text = self.get_message_text()
-        message_to = self.redis_inst.srandmember('handlers')
+        message_to = self.redis_inst.pubsub_channels('message_for*')
 
         if not message_to:
             print('А сообщение то отправлять и некому, будем ждать...')
 
         else:
-            self.redis_inst.publish(f'message_for_{message_to}', json.dumps({
-                'event': PROCESS_MESSAGE_EVENT,
-                'message': message_text
-            }))
-
-    def switch_to_other(self):
-        print('Переключаем генератор')
-
-        new_generator = self.redis_inst.spop('handlers')
-        if not new_generator:
-            print('Это было последнее приложение, теперь всему конец')
-            self.destroy()
-            return
-
-        self.redis_inst.publish(f'message_for_{new_generator}', json.dumps({
-            'event': BECOME_GENERATOR_EVENT
-        }))
-
-    def on_keyboard_interrupt(self):
-        self.switch_to_other()
-
-    def destroy(self):
-        self.redis_inst.delete('generator')
+            message_to = random.choice(message_to)
+            self.redis_inst.publish(message_to, message_text)
 
 
 class Handler:
@@ -94,46 +56,51 @@ class Handler:
         self.name = str(uuid4())
         self.redis_inst = redis_inst
 
-        redis_inst.sadd('handlers', self.name)
-
         self.pub_sub = redis_inst.pubsub()
         self.pub_sub.subscribe(f'message_for_{self.name}')
 
+    def check_generator(self):
+        if self.redis_inst.incr('checking_generator_lock') == 1:
+            generator = None
+            if not self.redis_inst.pubsub_channels('generator'):
+                generator = self.become_generator()
+
+            self.redis_inst.expire('checking_generator_lock', datetime.timedelta(milliseconds=100))
+            return generator
+
     def process_loop(self):
+        generator = self.check_generator()
+        if generator:
+            return generator
+
         message = self.pub_sub.get_message()
         if message and message['type'] == 'message':
-            generator = self.process_message(message['data'])
-            if generator:
-                return generator
+            self.process_message(message['data'])
 
+        time.sleep(0.02)
         return self
 
     def become_generator(self):
+        print(f'Превращаюсь в генератор')
         self.destroy()
-
-        print(f'Я становлюсь генератором')
 
         return Generator(self.redis_inst)
 
     def process_message(self, message):
-        message = json.loads(message)
-        if message['event'] == PROCESS_MESSAGE_EVENT:
-            print(f'Сообщение {message["message"]}')
+        print(f'Получил {message}')
 
-            if random.randint(0, 19) == 0:
-                self.redis_inst.rpush('errors', message["message"])
-
-        elif message['event'] == BECOME_GENERATOR_EVENT:
-            return self.become_generator()
-
-        else:
-            print(f'А я не знаю события {message["event"]}')
+        if random.randint(0, 19) == 0:
+            self.redis_inst.rpush('errors', message)
 
     def destroy(self):
-        self.redis_inst.srem('handlers', self.name)
+        self.pub_sub.close()
 
-    def on_keyboard_interrupt(self):
-        self.destroy()
+
+def process_errors(redis_inst):
+    error_item = redis_inst.lpop('errors')
+    while error_item:
+        print(error_item)
+        error_item = redis_inst.lpop('errors')
 
 
 if __name__ == '__main__':
